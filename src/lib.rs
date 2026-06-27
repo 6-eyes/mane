@@ -1,9 +1,11 @@
 mod config;
 
-use std::{net::SocketAddr, path::PathBuf};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use crate::config::{Error as ConfigError, Config,};
+
+const NAME: &str = env!("CARGO_PKG_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run() -> Result<(), Error> {
     // check rsync
@@ -11,14 +13,17 @@ pub fn run() -> Result<(), Error> {
 
     // initialize tracing
     init_tracing();
+    tracing::info!("starting {}, version: {}, pid: {}", NAME, VERSION, std::process::id());
 
     // initialize config
-    let (config, _debouncer) = match Config::init() {
+    let watcher = match Config::init() {
         Ok(config) => config,
-        Err(e) => return Err(Error::Config(e)),
+        Err(e) => {
+            tracing::error!("error creating config: {e}");
+            return Err(Error::Config(e))
+        },
     };
 
-    tracing::debug!("loaded config {config:?}");
     // start tokio executor
 
     std::thread::sleep(std::time::Duration::MAX);
@@ -28,15 +33,6 @@ pub fn run() -> Result<(), Error> {
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_env("LOG_FILTER").unwrap_or_else(|_| EnvFilter::new(Level::INFO.as_str()));
     tracing_subscriber::fmt().with_target(false).with_level(true).with_env_filter(env_filter).init();
-}
-
-/// Describes parameters for a synchronization operation.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sync {
-    local_path: PathBuf,
-    remote_path: PathBuf,
-    remote_addr: SocketAddr,
 }
 
 #[derive(Debug)]

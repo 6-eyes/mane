@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-notify-debouncer-mini = { version = "0.7.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "process", "sync", "time", "fs"] }
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 which = "8.0.4"
+notify = "8.2.0"
