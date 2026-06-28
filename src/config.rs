@@ -1,7 +1,7 @@
 //! configuration for the mane synchronization tool.
 
-use std::{env::{args, home_dir}, fmt::Display, fs::read_to_string, io::Error as IoError, net::SocketAddr, path::PathBuf, sync::{Mutex, OnceLock, mpsc::{self, Receiver}}, thread::{self, sleep}, time::Duration};
-use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, Result as NotifyResult, Watcher, event::{DataChange, ModifyKind, RemoveKind}, recommended_watcher};
+use std::{env::{args, home_dir}, fmt::Display, fs::read_to_string, io::Error as IoError, net::SocketAddr, path::PathBuf, sync::mpsc::{self, Receiver}, thread::{self, sleep}, time::Duration};
+use notify::{Event as NotifyEvent, EventKind, Result as NotifyResult, Watcher, event::{DataChange, ModifyKind, RemoveKind}, recommended_watcher};
 use toml::de::Error as TomlError;
 
 // constants
@@ -9,10 +9,6 @@ use toml::de::Error as TomlError;
 const DEFAULT_CONFIG_PATH: &str = ".config/mane/config.toml";
 /// the configuration polling interval
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// static watcher
-/// the watcher should never be dropped
-static WATCHER: OnceLock<Mutex<Option<RecommendedWatcher>>> = OnceLock::new();
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct Config {
@@ -36,41 +32,41 @@ impl Config {
         let (tx, rx) = mpsc::sync_channel::<Self>(1);
         // thread to listen to watcher reset requests
         thread::spawn(move || {
-            let (reset_watcher_tx, reset_watcher_rx) = mpsc::sync_channel(1);
-            // send once
-            reset_watcher_tx.send(()).expect("unable to send request to reset watcher");
-
-            while reset_watcher_rx.recv().is_ok() {
-                /// function to get the watcher
-                fn get_watcher() -> &'static Mutex<Option<RecommendedWatcher>> {
-                    WATCHER.get_or_init(|| Mutex::new(None))
-                }
-
-                if ! config_dir.exists() {
+            loop {
+                // wait for the config directory to exist
+                while ! config_dir.exists() {
                     tracing::warn!("directory {} doesn't exist. will check after {} secs", config_dir.display(), POLL_INTERVAL.as_secs());
-
-                    // set watcher
-                    *get_watcher().lock().unwrap() = None;
-                    // send for next cycle
-                    reset_watcher_tx.send(()).expect("unable to send request to reset watcher");
-                    // sleep
                     sleep(POLL_INTERVAL);
-                    continue;
                 }
 
                 // create watcher
+                /// Describes the set of events of interest from the `inotfy` on linux target.
+                #[derive(Debug)]
+                enum Event {
+                    ParentRemoved,
+                    ConfigChanged(Config),
+                }
+
+                impl From<Config> for Event {
+                    fn from(value: Config) -> Self {
+                        Self::ConfigChanged(value)
+                    }
+                }
+
+                // create channel to capture events
+                let (event_tx, event_rx) = mpsc::sync_channel(1);
+
+                tracing::debug!("creating new watcher");
                 let mut watcher = recommended_watcher({
                     let config_path = config_path.clone();
                     let config_dir = config_dir.clone();
-                    let tx = tx.clone();
-                    let reset_watch_tx = reset_watcher_tx.clone();
 
                     move |res: NotifyResult<NotifyEvent>| {
                         let Ok(NotifyEvent { kind, paths, .. }) = res else { return };
                         tracing::debug!("received event kind: {kind:?}, paths: {paths:?}");
                         if matches!(kind, EventKind::Remove(RemoveKind::Folder)) && paths.iter().any(|p| p == &config_dir) {
                             tracing::warn!("config directory {} deleted", config_dir.display());
-                            reset_watch_tx.send(()).expect("unable to notify watcher reset");
+                            event_tx.send(Event::ParentRemoved).expect("unable to notify watcher reset");
                             return;
                         }
 
@@ -85,7 +81,7 @@ impl Config {
                                         }
 
                                         // send
-                                        if tx.try_send(config).is_err() {
+                                        if event_tx.try_send(Event::ConfigChanged(config)).is_err() {
                                             tracing::error!("unable to send config updates");
                                         }
 
@@ -99,12 +95,24 @@ impl Config {
                     }
                 }).expect("unable to create watcher");
 
+                tracing::debug!("initializing watcher over directory {}", config_dir.display());
                 watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive).expect("unable to start watcher");
 
-                // replace
-                *get_watcher().lock().unwrap() = Some(watcher);
+                tracing::info!("watcher on directory {} initialized", config_dir.display());
 
-                tracing::info!("initialized new watcher");
+                // watcher is kept alive until the while loop exits
+                while let Ok(event) = event_rx.recv() {
+                    match event {
+                        Event::ParentRemoved => {
+                            tracing::debug!("dropping watcher");
+                            break;
+                        },
+                        Event::ConfigChanged(config) => {
+                            tracing::info!("config changed");
+                            tx.try_send(config).unwrap();
+                        },
+                    }
+                }
             }
         });
 
