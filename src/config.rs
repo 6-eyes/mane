@@ -1,8 +1,8 @@
 //! configuration for the mane synchronization tool.
 
-use std::{env::{args, home_dir}, fmt::Display, fs::read_to_string, io::Error as IoError, net::SocketAddr, path::PathBuf, sync::mpsc::{self, Receiver}, thread::{self, sleep}, time::Duration};
+use std::{env::{args, home_dir}, fmt::Display, net::SocketAddr, path::PathBuf, time::Duration};
 use notify::{Event as NotifyEvent, EventKind, Result as NotifyResult, Watcher, event::{DataChange, ModifyKind, RemoveKind}, recommended_watcher};
-use toml::de::Error as TomlError;
+use tokio::{fs::try_exists, sync::{mpsc, watch::{self, Receiver}}, time::sleep};
 
 // constants
 /// default config path
@@ -17,6 +17,8 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    /// ## Panics
+    /// If not called within a tokio runtime.
     pub(crate) fn init() -> Result<Receiver<Self>, Error> {
         // fetch config path
         let mut args = args().skip(1);
@@ -26,38 +28,38 @@ impl Config {
             None => home_dir().ok_or(Error::HomeDirNotFound)?.join(DEFAULT_CONFIG_PATH),
         };
 
-        let config_dir = config_path.parent().expect("unable to determine parent").to_path_buf();
+        let config_dir = config_path.parent().ok_or_else(|| Error::ParentNotFound(config_path.clone()))?.to_path_buf();
         tracing::info!("using configuration path: {}", config_path.display());
 
-        let (tx, rx) = mpsc::sync_channel::<Self>(1);
+        let (tx, rx) = watch::channel(Self::default());
         // thread to listen to watcher reset requests
-        thread::spawn(move || {
+        tokio::spawn(async move {
             loop {
                 // wait for the config directory to exist
-                while ! config_dir.exists() {
-                    tracing::warn!("directory {} doesn't exist. will check after {} secs", config_dir.display(), POLL_INTERVAL.as_secs());
-                    sleep(POLL_INTERVAL);
+                loop {
+                    match try_exists(&config_dir).await {
+                        Ok(true) => break,
+                        Ok(false) => tracing::warn!("directory {} doesn't exist. will check after {} secs", config_dir.display(), POLL_INTERVAL.as_secs()),
+                        Err(e) => tracing::error!("unable to fetch metadata for directory {}. will check after {} secs. {}", config_dir.display(), POLL_INTERVAL.as_secs(), e),
+                    }
+                    sleep(POLL_INTERVAL).await;
                 }
 
                 // create watcher
                 /// Describes the set of events of interest from the `inotfy` on linux target.
                 #[derive(Debug)]
                 enum Event {
+                    /// Event signifies that the parent directory is removed. Recreate the watcher once the directory exists.
                     ParentRemoved,
-                    ConfigChanged(Config),
-                }
-
-                impl From<Config> for Event {
-                    fn from(value: Config) -> Self {
-                        Self::ConfigChanged(value)
-                    }
+                    /// Event signifying that the configuration has changed.
+                    ConfigChanged,
                 }
 
                 // create channel to capture events
-                let (event_tx, event_rx) = mpsc::sync_channel(1);
+                let (event_tx, mut event_rx) = mpsc::channel(1);
 
                 tracing::debug!("creating new watcher");
-                let mut watcher = recommended_watcher({
+                let Ok(mut watcher) = recommended_watcher({
                     let config_path = config_path.clone();
                     let config_dir = config_dir.clone();
 
@@ -66,50 +68,77 @@ impl Config {
                         tracing::debug!("received event kind: {kind:?}, paths: {paths:?}");
                         if matches!(kind, EventKind::Remove(RemoveKind::Folder)) && paths.iter().any(|p| p == &config_dir) {
                             tracing::warn!("config directory {} deleted", config_dir.display());
-                            event_tx.send(Event::ParentRemoved).expect("unable to notify watcher reset");
+                            // this needs to be sent
+                            // it is okay to expect because we are blocking the send
+                            if let Err(e) = event_tx.blocking_send(Event::ParentRemoved) {
+                                tracing::info!("unable to notify the removal to parent directory: {}. terminating.", e);
+                                std::process::exit(1);
+                            }
+
                             return;
                         }
 
-                        if matches!(kind, EventKind::Modify(ModifyKind::Data(DataChange::Any))) && paths.iter().any(|p| p == &config_path) {
-                            match read_to_string(&config_path) {
-                                Ok(contents) => match toml::from_str::<Self>(&contents) {
-                                    Ok(config) => {
-                                        // vaidate
-                                        if config.syncs.is_empty() {
-                                            tracing::warn!("no syncs found in configuration");
-                                            return;
-                                        }
-
-                                        // send
-                                        if event_tx.try_send(Event::ConfigChanged(config)).is_err() {
-                                            tracing::error!("unable to send config updates");
-                                        }
-
-                                        tracing::info!("config updated");
-                                    }
-                                    Err(e) => tracing::error!("error parsing config file {}: {}", config_path.display(), e),
-                                },
-                                Err(e) => tracing::error!("unable to read contents of config file {}: {}", config_path.display(), e),
-                            }
+                        if matches!(kind, EventKind::Modify(ModifyKind::Data(DataChange::Any))) && paths.iter().any(|p| p == &config_path) && event_tx.try_send(Event::ConfigChanged).is_err() {
+                            tracing::error!("unable to send config updates");
                         }
                     }
-                }).expect("unable to create watcher");
+                }) else {
+                    tracing::error!("unable to create a new watcher. will try after {} secs", POLL_INTERVAL.as_secs());
+                    sleep(POLL_INTERVAL).await;
+                    continue;
+                };
 
                 tracing::debug!("initializing watcher over directory {}", config_dir.display());
-                watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive).expect("unable to start watcher");
+                if let Err(e) = watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive) {
+                    tracing::error!("unable to initialize watcher over the directory {}. will try after {} secs: {}", config_dir.display(), POLL_INTERVAL.as_secs(), e);
+                    sleep(POLL_INTERVAL).await;
+                    continue;
+                }
 
                 tracing::info!("watcher on directory {} initialized", config_dir.display());
 
                 // watcher is kept alive until the while loop exits
-                while let Ok(event) = event_rx.recv() {
+                while let Some(event) = event_rx.recv().await {
                     match event {
                         Event::ParentRemoved => {
                             tracing::debug!("dropping watcher");
                             break;
                         },
-                        Event::ConfigChanged(config) => {
+                        Event::ConfigChanged => {
+                            // fetch contents
+                            let contents = match tokio::fs::read_to_string(&config_path).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!("unable to read contents of config file {}: {}", config_path.display(), e);
+                                    continue;
+                                },
+                            };
+
+                            // parse
+                            let new = match toml::from_str::<Self>(&contents) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!("error parsing config file {}: {}", config_path.display(), e);
+                                    continue;
+                                },
+                            };
+
+                            // validate
+                            if new.syncs.is_empty() {
+                                tracing::warn!("no syncs to configure");
+                                continue;
+                            }
+
                             tracing::info!("config changed");
-                            tx.try_send(config).unwrap();
+                            tx.send_if_modified(|config| {
+                                if config.syncs != new.syncs {
+                                    *config = new;
+                                    true
+                                }
+                                else {
+                                    false
+                                }
+                            });
                         },
                     }
                 }
@@ -121,7 +150,7 @@ impl Config {
 }
 
 /// Describes parameters for a synchronization operation.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct SyncConfig {
     local_path: PathBuf,
@@ -131,24 +160,18 @@ struct SyncConfig {
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    HomeDirNotFound,
     InvalidArg(Option<String>),
-    InvalidConfig(TomlError),
-    Create(IoError),
-    Read(IoError),
-    Parent(PathBuf),
+    HomeDirNotFound,
+    ParentNotFound(PathBuf),
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HomeDirNotFound => write!(f, "home directory not found"),
+            Self::InvalidArg(Some(arg)) => write!(f, "invalid argument passed: {arg}"),
             Self::InvalidArg(None) => write!(f, "no argument passed"),
-            Self::InvalidArg(Some(arg)) => write!(f, "invalid argument: {arg:?}"),
-            Self::InvalidConfig(e) => write!(f, "invalid config: {e}"),
-            Self::Create(e) => write!(f, "error creating config file: {}", e),
-            Self::Read(e) => write!(f, "error reading from config file: {}", e),
-            Self::Parent(path) => write!(f, "error determining parent path for {}", path.display()),
+            Self::HomeDirNotFound => write!(f, "unable to determine home directory"),
+            Self::ParentNotFound(path) => write!(f, "error determining parent path for {}", path.display()),
         }
     }
 }

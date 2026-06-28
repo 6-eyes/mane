@@ -1,3 +1,3 @@
 fn main() {
-    mane::run().unwrap();
+    mane::run();
 }
