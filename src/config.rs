@@ -1,7 +1,7 @@
 //! configuration for the mane synchronization tool.
 
-use std::{env::{args, home_dir}, fmt::Display, net::SocketAddr, path::PathBuf, time::Duration};
-use notify::{Event as NotifyEvent, EventKind, Result as NotifyResult, Watcher, event::{DataChange, ModifyKind, RemoveKind}, recommended_watcher};
+use std::{env::{args, home_dir}, fmt::Display, net::SocketAddr, path::{Path, PathBuf}, time::Duration};
+use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Result as NotifyResult, Watcher, event::{DataChange, ModifyKind, RemoveKind}, recommended_watcher};
 use tokio::{fs::try_exists, sync::{mpsc, watch::{self, Receiver}}, time::sleep};
 
 // constants
@@ -64,7 +64,11 @@ impl Config {
                     let config_dir = config_dir.clone();
 
                     move |res: NotifyResult<NotifyEvent>| {
-                        let Ok(NotifyEvent { kind, paths, .. }) = res else { return };
+                        let Ok(NotifyEvent { kind, paths, .. }) = res else {
+                            tracing::error!("error receiving notification event on path {}: {}", config_dir.display(), res.unwrap_err());
+                            return;
+                        };
+
                         tracing::debug!("received event kind: {kind:?}, paths: {paths:?}");
                         if matches!(kind, EventKind::Remove(RemoveKind::Folder)) && paths.iter().any(|p| p == &config_dir) {
                             tracing::warn!("config directory {} deleted", config_dir.display());
@@ -89,7 +93,7 @@ impl Config {
                 };
 
                 tracing::debug!("initializing watcher over directory {}", config_dir.display());
-                if let Err(e) = watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive) {
+                if let Err(e) = watcher.watch(&config_dir, RecursiveMode::NonRecursive) {
                     tracing::error!("unable to initialize watcher over the directory {}. will try after {} secs: {}", config_dir.display(), POLL_INTERVAL.as_secs(), e);
                     sleep(POLL_INTERVAL).await;
                     continue;
@@ -147,15 +151,21 @@ impl Config {
 
         Ok(rx)
     }
+
+    pub(crate) fn syncs(&self) -> &[SyncConfig] {
+        self.syncs.as_ref()
+    }
 }
 
 /// Describes parameters for a synchronization operation.
-#[derive(Debug, serde::Deserialize, PartialEq)]
+#[derive(Debug, serde::Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
-struct SyncConfig {
-    local_path: PathBuf,
-    remote_path: PathBuf,
-    remote_addr: SocketAddr,
+pub(crate) struct SyncConfig {
+    /// The local path. Also referred as the source path.
+    pub(crate) local_path: PathBuf,
+    /// The remote parh. Also referred as the destination path.
+    pub(crate) remote_path: PathBuf,
+    pub(crate) remote_address: SocketAddr,
 }
 
 #[derive(Debug)]

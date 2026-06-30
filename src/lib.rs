@@ -1,8 +1,9 @@
 mod config;
+mod task;
 
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
-use crate::config::Config;
+use crate::{config::Config, task::TaskPool};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -20,7 +21,6 @@ pub fn run() {
 
     tracing::debug!("rsync path: {}", rsync_path.display());
 
-
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     runtime.block_on(async move {
         // initialize config
@@ -32,9 +32,12 @@ pub fn run() {
            },
         };
 
+        let mut task_pool = TaskPool::default();
+
         // listen on watcher
         while let Ok(()) = watcher.changed().await {
             tracing::info!("new config: {:?}", watcher.borrow());
+            task_pool.update(watcher.borrow().syncs());
         }
     })
 }
